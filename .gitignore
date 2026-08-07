@@ -1,3 +1,21 @@
+# Python
 __pycache__/
-pgdata/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# VS Code / IDEs
+.vscode/
+.idea/
+
+# Environment variables & secrets
 .env
+
+# Docker / OS overhead
+.DS_Store
+Thumbs.db
+pgdata/
