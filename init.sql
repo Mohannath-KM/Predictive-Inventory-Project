@@ -69,3 +69,17 @@ INSERT INTO INVENTORYBIN (Item, Inventory, BinNumber, CurrentCount, MinimumCount
 VALUES 
 ('ITEM-101', 'p4toolroom', 'B-12', 100, 15),
 ('ITEM-102', 'p4toolroom', 'B-14', 5, 20);
+
+
+-- Predictive Reorder Recommendations Ledger
+CREATE TABLE IF NOT EXISTS REORDER_RECOMMENDATION (
+    Id SERIAL PRIMARY KEY,
+    InventoryBinId INT REFERENCES INVENTORYBIN(Id),
+    Item VARCHAR(50) NOT NULL,
+    CurrentStock INT NOT NULL,
+    DailyBurnRate DECIMAL(10,2),
+    EstimatedDaysRemaining DECIMAL(10,2),
+    SuggestedReorderQty INT NOT NULL,
+    PriorityStatus VARCHAR(20) DEFAULT 'NORMAL', -- 'CRITICAL', 'WARNING', 'NORMAL'
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

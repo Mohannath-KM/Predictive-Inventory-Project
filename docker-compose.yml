@@ -21,6 +21,8 @@ services:
       - "6379:6379"
 
   # 3. Apache Kafka (KRaft Mode)
+# 3. Apache Kafka (KRaft Mode)
+# 3. Apache Kafka (KRaft Mode)
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     container_name: fba_kafka
@@ -34,6 +36,10 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
       KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
       KAFKA_STATUS_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       KAFKA_COMPACT_LOG_MIN_CLEANABLE_RATIO: '0.3'
       KAFKA_ENV_LATEST_COMPATIBILITY_MODE: 'true'
       KAFKA_PROCESS_ROLES: 'broker,controller'
@@ -55,6 +61,18 @@ services:
       - postgres
       - redis
       - kafka
+
+  # 5. Kafka Background Consumer Worker
+  worker:
+    build: .
+    container_name: fba_kafka_worker
+    command: python -m app.consumer
+    environment:
+      - DATABASE_URL=postgresql://fba_admin:password123@postgres:5432/fba_inventory
+      - KAFKA_SERVERS=kafka:9092
+    depends_on:
+      - kafka
+      - postgres
 
 volumes:
   pgdata:
