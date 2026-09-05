@@ -187,3 +187,5 @@ REDIS_HOST	redis	Redis service hostname
 KAFKA_SERVERS	kafka:9092	Internal Kafka broker listener
 SUPPLIER_WEBHOOK_URL	https://httpbin.org/post	Outbound destination for automated PO webhooks
 <img width="568" height="535" alt="image" src="https://github.com/user-attachments/assets/b98cfb04-f511-4c3d-832d-b7121c453b02" />
+
+<img width="825" height="435" alt="image" src="https://github.com/user-attachments/assets/4fd40989-4305-47e7-813f-e63b6b40633b" />
