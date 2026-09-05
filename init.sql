@@ -67,8 +67,8 @@ CREATE TABLE CHECKOUT_ITEM (
 -- FIXED: Added BinNumber to columns, fixed values ordering matching your columns
 INSERT INTO INVENTORYBIN (Item, Inventory, BinNumber, CurrentCount, MinimumCount)
 VALUES 
-('ITEM-101', 'p4toolroom', 'B-12', 100, 15),
-('ITEM-102', 'p4toolroom', 'B-14', 5, 20);
+('ITEM-10', 'Inven-01', 'BIN-1', 100, 15),
+('ITEM-12', 'Inven-02', 'BIN-2', 50, 20);
 
 
 -- Predictive Reorder Recommendations Ledger

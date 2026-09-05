@@ -2,11 +2,34 @@ import os
 import json
 import asyncio
 import asyncpg
+import httpx
 from aiokafka import AIOKafkaConsumer, TopicPartition
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://fba_admin:password123@postgres:5432/fba_inventory")
 KAFKA_SERVERS = os.getenv("KAFKA_SERVERS", "kafka:9092")
 KAFKA_TOPIC = "inventory-checkout-events"
+# Mock or external ERP procurement webhook receiver
+SUPPLIER_WEBHOOK_URL = os.getenv("SUPPLIER_WEBHOOK_URL", "https://httpbin.org/post")
+
+async def dispatch_supplier_reorder_po(item_code: str, qty: int, priority: str, bin_id: int):
+    """Sends an automated Purchase Order dispatch to the supplier procurement webhook."""
+    payload = {
+        "action": "CREATE_PURCHASE_ORDER",
+        "item_code": item_code,
+        "reorder_quantity": qty,
+        "priority": priority,
+        "target_bin_id": bin_id,
+        "system_source": "Predictive-Inventory-FBA-Worker"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(SUPPLIER_WEBHOOK_URL, json=payload)
+            if resp.status_code in [200, 201, 202]:
+                print(f"  📦 [WEBHOOK DISPATCHED] Automated PO transmitted to supplier for {qty}x {item_code} (Status: {resp.status_code})", flush=True)
+            else:
+                print(f"  ⚠️ [WEBHOOK WARNING] Supplier endpoint returned status: {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"  ❌ [WEBHOOK FAILED] Could not dispatch supplier PO: {e}", flush=True)
 
 async def calculate_burn_rate_and_runout(conn, bin_id: int, current_stock: int):
     query = '''
@@ -27,6 +50,16 @@ async def calculate_burn_rate_and_runout(conn, bin_id: int, current_stock: int):
     return daily_burn_rate, days_remaining
 
 async def process_checkout_event(event: dict):
+    # 1. Handle stock replenishment check-in audit events
+    if event.get("event_type") == "STOCK_REPLENISHED":
+        print(
+            f"\n📦 [AUDIT EVENT] Stock replenished: {event.get('added_count')} units added to Bin {event.get('bin_id')} "
+            f"({event.get('item_code')}) by {event.get('received_by')} | New Total: {event.get('new_total_stock')}",
+            flush=True
+        )
+        return
+
+    # 2. Handle stock checkout events
     bin_id = event.get("bin_id")
     item_code = event.get("item_code")
     count = event.get("count")
@@ -67,6 +100,9 @@ async def process_checkout_event(event: dict):
                 bin_id, item_code, remaining_stock, daily_burn, days_left, reorder_qty, priority
             )
             print(f"  🚨 [{priority} ALERT] Auto-generated replenishment recommendation: Order {reorder_qty} units of {item_code}.", flush=True)
+
+            # Fire async webhook dispatch to external supplier ERP
+            await dispatch_supplier_reorder_po(item_code, reorder_qty, priority, bin_id)
 
     finally:
         await conn.close()

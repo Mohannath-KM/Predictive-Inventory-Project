@@ -20,7 +20,7 @@ redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0)
 producer: AIOKafkaProducer = None
 
 # --- Pydantic Request Schemas ---
-
+# 1. Single-item checkout
 class CheckoutRequest(BaseModel):
     request_id: str
     bin_id: int
@@ -28,15 +28,38 @@ class CheckoutRequest(BaseModel):
     count: int
     requester: str
 
+# 2. Multi-item checkout line item
 class CheckoutItemPayload(BaseModel):
     bin_id: int
     item_code: str
     count: int
 
+# 3. Batch checkout container
 class MultiCheckoutRequest(BaseModel):
     request_id: str
     requester: str
     items: List[CheckoutItemPayload]
+
+
+# 1. Single-item check-in
+class CheckinRequest(BaseModel):
+    reference_id: str
+    bin_id: int
+    item_code: str
+    count: int
+    received_by: str
+
+# 2. Multi-item check-in line item 
+class CheckinItemPayload(BaseModel):
+    bin_id: int
+    item_code: str
+    count: int
+
+# 3. Batch check-in container
+class MultiCheckinRequest(BaseModel):
+    reference_id: str
+    received_by: str
+    items: List[CheckinItemPayload]
 
 # --- Lifecycle Events ---
 
@@ -256,6 +279,183 @@ async def checkout_stock_batch(req: MultiCheckoutRequest):
         for l_key in locks_acquired:
             redis_client.delete(l_key)
 
+
+
+@app.post("/checkin", status_code=status.HTTP_200_OK)
+async def checkin_stock(req: CheckinRequest):
+    """Replenishes inventory stock, updates active reorder recommendations, and emits an audit event."""
+    if req.count <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Check-in quantity must be greater than zero."
+        )
+
+    lock_key = f"lock:bin:{req.bin_id}"
+    acquired = redis_client.set(lock_key, "locked", nx=True, ex=5)
+
+    if not acquired:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bin is currently locked by another transaction. Please retry."
+        )
+
+    try:
+        conn = await asyncpg.connect(DB_URL)
+        try:
+            async with conn.transaction():
+                # 1. Fetch current stock with row lock
+                row = await conn.fetchrow(
+                    'SELECT "currentcount", "minimumcount" FROM "inventorybin" WHERE "id" = $1 FOR UPDATE',
+                    req.bin_id
+                )
+                if not row:
+                    raise HTTPException(status_code=404, detail=f"Bin ID {req.bin_id} not found")
+
+                current_stock = row['currentcount']
+                new_stock = current_stock + req.count
+
+                # 2. Update stock count in INVENTORYBIN
+                await conn.execute(
+                    'UPDATE "inventorybin" SET "currentcount" = $1 WHERE "id" = $2',
+                    new_stock, req.bin_id
+                )
+
+                # 3. Resolve existing active alerts in REORDER_RECOMMENDATION
+                await conn.execute(
+                    '''
+                    UPDATE "reorder_recommendation"
+                    SET "prioritystatus" = 'RESOLVED'
+                    WHERE "inventorybinid" = $1 AND "prioritystatus" IN ('CRITICAL', 'WARNING')
+                    ''',
+                    req.bin_id
+                )
+
+        finally:
+            await conn.close()
+
+        # 4. Stream audit event to Kafka
+        event_payload = {
+            "event_type": "STOCK_REPLENISHED",
+            "reference_id": req.reference_id,
+            "bin_id": req.bin_id,
+            "item_code": req.item_code,
+            "added_count": req.count,
+            "new_total_stock": new_stock,
+            "received_by": req.received_by
+        }
+        await producer.send_and_wait("inventory-checkout-events", event_payload)
+
+        return {
+            "status": "Success",
+            "message": f"Successfully added {req.count} units of {req.item_code}",
+            "previous_stock": current_stock,
+            "new_stock": new_stock
+        }
+
+    finally:
+        redis_client.delete(lock_key)
+
+
+@app.post("/checkin/batch", status_code=status.HTTP_200_OK)
+async def checkin_stock_batch(req: MultiCheckinRequest):
+    if not req.items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Item list cannot be empty."
+        )
+
+    # Sort bin IDs to prevent deadlocks across distributed transactions
+    bin_ids = sorted([item.bin_id for item in req.items])
+    locks_acquired = []
+
+    try:
+        # 1. Acquire Redis distributed locks for each bin
+        for b_id in bin_ids:
+            lock_key = f"lock:bin:{b_id}"
+            acquired = redis_client.set(lock_key, "locked", nx=True, ex=10)
+            if not acquired:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Bin {b_id} is currently locked by another transaction. Please retry."
+                )
+            locks_acquired.append(lock_key)
+
+        conn = await asyncpg.connect(DB_URL)
+        replenished_summary = []
+        try:
+            async with conn.transaction():
+                for item in req.items:
+                    if item.count <= 0:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Check-in count for bin {item.bin_id} must be greater than zero."
+                        )
+
+                    # Fetch current stock with row-level lock
+                    row = await conn.fetchrow(
+                        'SELECT "currentcount" FROM "inventorybin" WHERE "id" = $1 FOR UPDATE',
+                        item.bin_id
+                    )
+                    if not row:
+                        raise HTTPException(status_code=404, detail=f"Bin ID {item.bin_id} not found")
+
+                    current_stock = row['currentcount']
+                    new_stock = current_stock + item.count
+
+                    # Update stock in INVENTORYBIN
+                    await conn.execute(
+                        'UPDATE "inventorybin" SET "currentcount" = $1 WHERE "id" = $2',
+                        new_stock, item.bin_id
+                    )
+
+                    # Mark active recommendations as RESOLVED
+                    await conn.execute(
+                        '''
+                        UPDATE "reorder_recommendation"
+                        SET "prioritystatus" = 'RESOLVED'
+                        WHERE "inventorybinid" = $1 AND "prioritystatus" IN ('CRITICAL', 'WARNING')
+                        ''',
+                        item.bin_id
+                    )
+
+                    replenished_summary.append({
+                        "bin_id": item.bin_id,
+                        "item_code": item.item_code,
+                        "added_count": item.count,
+                        "previous_stock": current_stock,
+                        "new_stock": new_stock
+                    })
+
+        finally:
+            await conn.close()
+
+        # 2. Publish replenishment audit events to Kafka
+        for item_data in replenished_summary:
+            event_payload = {
+                "event_type": "STOCK_REPLENISHED",
+                "reference_id": req.reference_id,
+                "bin_id": item_data["bin_id"],
+                "item_code": item_data["item_code"],
+                "added_count": item_data["added_count"],
+                "new_total_stock": item_data["new_stock"],
+                "received_by": req.received_by
+            }
+            await producer.send_and_wait("inventory-checkout-events", event_payload)
+
+        return {
+            "status": "Success",
+            "message": "Batch check-in processed successfully",
+            "reference_id": req.reference_id,
+            "items_updated": len(replenished_summary),
+            "details": replenished_summary
+        }
+
+    finally:
+        # Release all acquired Redis locks
+        for l_key in locks_acquired:
+            redis_client.delete(l_key)
+            
+
 # --- Analytics Endpoint ---
 
 @app.get("/analytics/reorder-recommendations")
@@ -265,7 +465,7 @@ async def get_reorder_recommendations():
     try:
         records = await conn.fetch(
             '''
-            SELECT "id", "inventorybinid", "item", "currentstock", 
+            SELECT "id", "inventorybinid", "item", "currentstock",
                    "dailyburnrate", "estimateddaysremaining", 
                    "suggestedreorderqty", "prioritystatus", "createdat"
             FROM "reorder_recommendation"
